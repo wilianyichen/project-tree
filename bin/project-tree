@@ -1,0 +1,2023 @@
+#!/usr/bin/env python3
+"""project-tree — unified server project tree CLI.
+
+Default (no subcommand): split montage view (tree + stats side-by-side).
+
+Subcommands:
+  scan         Scan filesystem → raw JSON
+  render       Render annotated JSON (tree|table|dash|split|md)
+  annotate     Heuristic annotation + corrections overlay
+  corrections  Apply corrections.json to annotated JSON
+  diff         Compare two raw JSON scans
+  find         Query annotated JSON by name/category/type/path
+  stats        Print summary statistics
+  update       Full pipeline: scan → annotate → render md
+
+Global flags: --theme, --no-size, --compact, --list-themes
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+from collections import Counter
+from pathlib import Path
+
+# ── Rich imports (optional: graceful degradation for stats/find in plain text) ──
+try:
+    from rich.console import Console
+    from rich.style import Style
+    from rich.text import Text
+    from rich.tree import Tree
+    from rich.table import Table
+    from rich.panel import Panel
+    from rich.layout import Layout
+    from rich import box
+    HAS_RICH = True
+except ImportError:
+    HAS_RICH = False
+
+# ── Constants ────────────────────────────────────────────────────────────────
+
+CONFIG_PATH = os.path.expanduser("~/.config/project-tree/watch-dirs.conf")
+THEMES_PATH = os.path.expanduser("~/.config/project-tree/themes.json")
+DESCRIPTIONS_PATH = os.path.expanduser("~/.config/project-tree/descriptions.json")
+CORRECTIONS_PATH = os.path.expanduser("~/.config/project-tree/corrections.json")
+RAW_PATH = os.path.expanduser("~/.cache/project-tree-raw.json")
+ANNOTATED_PATH = os.path.expanduser("~/.cache/project-tree-annotated.json")
+BASELINE_PATH = os.path.expanduser("~/.cache/project-tree-raw.baseline.json")
+MD_OUTPUT = os.path.expanduser("~/PROJECT-TREE.md")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Shared Utilities
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def walk_nodes(node):
+    """Generator yielding all nodes in tree (depth-first, including root)."""
+    yield node
+    for child in (node.get('children') or []):
+        yield from walk_nodes(child)
+
+
+def collect_paths(node, acc=None):
+    """Build a path→node dict from a tree."""
+    if acc is None:
+        acc = {}
+    acc[node.get('path', '')] = node
+    for child in (node.get('children') or []):
+        collect_paths(child, acc)
+    return acc
+
+
+def load_json(path):
+    """Load JSON file with error handling."""
+    try:
+        with open(path, encoding='utf-8') as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        print(f"Error loading {path}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def load_descriptions(path=DESCRIPTIONS_PATH):
+    """Load descriptions and highlights from JSON file."""
+    _DEFAULT_DESC = {
+        'bin': '用户 wrapper 脚本', '.claude': 'Claude Code agent 中枢',
+        'learn': '学习材料', 'Documents': '文档与笔记', 'notes': 'org-mode 笔记',
+        'record': '知识资产', 'software': '已安装软件', 'opt': '可选软件',
+        'tmp': '临时工作区', 'desk': '主工作盘 (19T) 入口', 'tools': '工具与技能项目',
+        'cnn': '视觉实验', 'infoproc': '音视频处理工作区', 'models': '共享模型',
+        'project': '独立小项目', 'archive': '备份/历史快照', 'data': '数据存储',
+        'conda-envs': 'conda 环境', 'skills': '已安装 skill 副本',
+        'TongueSAM': '舌诊 SAM (最完整)', 'promptskill-router': 'prompt skill 路由引擎',
+        'knowledge-network-system': '知识网络系统 (126M)',
+        'baidupan-tools': '百度网盘工具总仓 (15M)',
+    }
+    _DEFAULT_HL = {
+        'desk', 'tools', 'cnn', 'infoproc', 'models', 'project', 'archive',
+        'bin', '.claude', 'CLAUDE.md', 'PROJECT-TREE.md',
+        'promptskill-router', 'TongueSAM', 'baidupan-tools',
+        'knowledge-network-system', 'embedding-server.py',
+    }
+    try:
+        with open(path, encoding='utf-8') as f:
+            data = json.load(f)
+        return data.get('descriptions', {}), set(data.get('highlights', []))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return _DEFAULT_DESC, _DEFAULT_HL
+
+
+def load_corrections(path=CORRECTIONS_PATH):
+    """Load path-based overrides."""
+    try:
+        with open(path, encoding='utf-8') as f:
+            return json.load(f).get('overrides', {})
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Scan
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_COLLAPSE_DOTDIRS_EXCEPT = {".claude", ".config"}
+_KNOWN_HOME_DATA = {"Downloads", "snap", "nltk_data", "opt", "code", "aliyun_get",
+                    "wget-log", "record", "software", "tmp"}
+_ALWAYS_DATA_DIRS = {
+    "backups", "cache", "file-history", "daemon", "dispatch",
+    "jobs", "projects", "plugins", "paste-cache",
+    "session-env", "sessions", "shell-snapshots", "tasks", "telemetry",
+    "shims", "plugin-index", "downloads", "installs", ".ipynb_checkpoints",
+}
+_MAX_CHILDREN_BEFORE_COLLAPSE = 50
+
+
+def load_scan_config(config_path=CONFIG_PATH):
+    """Source bash config and parse watch-dirs settings."""
+    script = f'''
+source "{config_path}" 2>/dev/null
+echo "===WATCH_ROOTS==="
+for item in "${{WATCH_ROOTS[@]}}"; do echo "$item"; done
+echo "===SKIP_NAMES==="
+for item in "${{SKIP_NAMES[@]}}"; do echo "$item"; done
+echo "===CONDA_INTERNALS==="
+for item in "${{CONDA_INTERNALS[@]}}"; do echo "$item"; done
+echo "===PROJECT_MARKERS==="
+for item in "${{PROJECT_MARKERS[@]}}"; do echo "$item"; done
+echo "===DATA_PATTERNS==="
+for item in "${{DATA_PATTERNS[@]}}"; do echo "$item"; done
+echo "===MAX_DEPTH==="
+echo "${{MAX_DEPTH:-4}}"
+'''
+    try:
+        result = subprocess.run(["bash", "-c", script], capture_output=True,
+                                text=True, timeout=10)
+        if result.returncode != 0:
+            print(f"Warning: bash config error:\n{result.stderr}", file=sys.stderr)
+        return _parse_scan_config(result.stdout)
+    except subprocess.TimeoutExpired:
+        print("Warning: config sourcing timed out, using defaults", file=sys.stderr)
+        return _default_scan_config()
+    except Exception as e:
+        print(f"Warning: config sourcing failed ({e}), using defaults", file=sys.stderr)
+        return _default_scan_config()
+
+
+def _parse_scan_config(output):
+    config = {"watch_roots": [], "skip_names": set(), "conda_internals": set(),
+              "project_markers": set(), "data_patterns": set(), "max_depth": 4}
+    current_key = None
+    for line in output.splitlines():
+        line = line.strip()
+        if line.startswith("===WATCH_ROOTS==="): current_key = "watch_roots"
+        elif line.startswith("===SKIP_NAMES==="): current_key = "skip_names"
+        elif line.startswith("===CONDA_INTERNALS==="): current_key = "conda_internals"
+        elif line.startswith("===PROJECT_MARKERS==="): current_key = "project_markers"
+        elif line.startswith("===DATA_PATTERNS==="): current_key = "data_patterns"
+        elif line.startswith("===MAX_DEPTH==="): current_key = "max_depth"
+        elif line and current_key:
+            if current_key == "max_depth":
+                try: config["max_depth"] = int(line)
+                except ValueError: pass
+            elif current_key == "watch_roots":
+                parts = line.split("|", 1)
+                if len(parts) == 2:
+                    config["watch_roots"].append((os.path.expandvars(parts[0]), parts[1]))
+            elif current_key in ("skip_names", "conda_internals", "project_markers", "data_patterns"):
+                config[current_key].add(line)
+    if not config["watch_roots"]:
+        config["watch_roots"] = [
+            (os.path.expanduser("~"), "~"),
+            ("/mnt/disk2/wuxiaoran", "/mnt/disk2/wuxiaoran"),
+        ]
+    return config
+
+
+def _default_scan_config():
+    return {
+        "watch_roots": [(os.path.expanduser("~"), "~"),
+                        ("/mnt/disk2/wuxiaoran", "/mnt/disk2/wuxiaoran")],
+        "skip_names": {".git", ".venv", "venv", "node_modules", "__pycache__"},
+        "conda_internals": {"bin", "lib", "include", "share", "etc", "conda-meta"},
+        "project_markers": {".git", "setup.py", "pyproject.toml", "package.json",
+                           "SKILL.md", "README.md"},
+        "data_patterns": {"models", "cache", "data", "checkpoints", "runs", "output"},
+        "max_depth": 4,
+    }
+
+
+def get_dir_size(path):
+    try:
+        result = subprocess.run(["du", "-sh", path], capture_output=True,
+                                text=True, timeout=30)
+        if result.returncode == 0:
+            return result.stdout.split()[0]
+    except (subprocess.TimeoutExpired, Exception):
+        pass
+    return None
+
+
+def is_project_dir(path, markers):
+    try:
+        found = set(os.listdir(path)) & markers
+        return bool(found), list(found)
+    except (PermissionError, OSError):
+        return False, []
+
+
+def should_skip(name, depth, skip_names, conda_internals):
+    if name in skip_names:
+        return True
+    if depth >= 2 and name in conda_internals:
+        return True
+    return False
+
+
+def should_terminate_as_data(name, depth, has_project_marker, children_count=0):
+    if has_project_marker:
+        return False
+    if name in _ALWAYS_DATA_DIRS:
+        return True
+    if depth > 0 and children_count > _MAX_CHILDREN_BEFORE_COLLAPSE:
+        return True
+    if depth == 1:
+        if name.startswith(".") and name not in _COLLAPSE_DOTDIRS_EXCEPT:
+            return True
+        if name in _KNOWN_HOME_DATA:
+            return True
+    return False
+
+
+def count_visible_subdirs(path, skip_names, conda_internals, depth):
+    count = 0
+    try:
+        for entry in os.scandir(path):
+            if entry.is_dir() and not should_skip(entry.name, depth + 1,
+                                                   skip_names, conda_internals):
+                count += 1
+    except (PermissionError, OSError):
+        pass
+    return count
+
+
+def scan_dir(path, depth, config, visited_inodes, include_sizes):
+    name = os.path.basename(path) or path
+    try:
+        is_sym = os.path.islink(path)
+    except OSError:
+        is_sym = False
+    symlink_target = os.readlink(path) if is_sym else None
+
+    if is_sym:
+        return {"name": name, "path": path, "depth": depth, "size": None,
+                "is_symlink": True, "symlink_target": symlink_target,
+                "children_count": 0, "has_project_marker": False, "markers_found": []}
+
+    try:
+        if not os.path.isdir(path):
+            return None
+    except OSError:
+        return None
+
+    try:
+        inode = os.stat(path).st_ino
+        if inode in visited_inodes:
+            size_str = get_dir_size(path) if include_sizes else None
+            return {"name": name, "path": path, "depth": depth, "size": size_str,
+                    "is_symlink": False, "symlink_target": None,
+                    "children_count": 0, "has_project_marker": False,
+                    "markers_found": [], "_loop": True}
+        visited_inodes.add(inode)
+    except OSError:
+        pass
+
+    has_marker, markers_found = is_project_dir(path, config["project_markers"])
+    is_data = name in config["data_patterns"]
+    size_str = get_dir_size(path) if include_sizes else None
+
+    if depth >= config["max_depth"]:
+        return {"name": name, "path": path, "depth": depth, "size": size_str,
+                "is_symlink": False, "symlink_target": None,
+                "children_count": 0, "has_project_marker": has_marker,
+                "markers_found": markers_found}
+
+    visible_children = count_visible_subdirs(path, config["skip_names"],
+                                              config["conda_internals"], depth)
+    if should_terminate_as_data(name, depth, has_marker, visible_children):
+        return {"name": name, "path": path, "depth": depth, "size": size_str,
+                "is_symlink": False, "symlink_target": None,
+                "children_count": visible_children,
+                "has_project_marker": has_marker, "markers_found": markers_found}
+
+    if has_marker or is_data:
+        return {"name": name, "path": path, "depth": depth, "size": size_str,
+                "is_symlink": False, "symlink_target": None,
+                "children_count": count_visible_subdirs(
+                    path, config["skip_names"], config["conda_internals"], depth),
+                "has_project_marker": has_marker, "markers_found": markers_found}
+
+    children = []
+    try:
+        entries = sorted(os.scandir(path), key=lambda e: e.name)
+    except (PermissionError, OSError):
+        entries = []
+    for entry in entries:
+        if not entry.is_dir() and not entry.is_symlink():
+            continue
+        if should_skip(entry.name, depth + 1, config["skip_names"], config["conda_internals"]):
+            continue
+        child = scan_dir(entry.path, depth + 1, config, visited_inodes, include_sizes)
+        if child:
+            children.append(child)
+
+    size_str = get_dir_size(path) if include_sizes else None
+    return {"name": name, "path": path, "depth": depth, "size": size_str,
+            "is_symlink": False, "symlink_target": None,
+            "children_count": len(children),
+            "has_project_marker": has_marker, "markers_found": markers_found,
+            "children": children if children else None}
+
+
+def scan_root(root_path, display_name, config, include_sizes):
+    visited = set()
+    node = scan_dir(root_path, 0, config, visited, include_sizes)
+    if node:
+        node["display_name"] = display_name
+        node["name"] = display_name
+    return node
+
+
+def cmd_scan(args):
+    config = load_scan_config()
+    if hasattr(args, 'max_depth') and args.max_depth:
+        config["max_depth"] = args.max_depth
+    include_sizes = not getattr(args, 'no_size', True)
+
+    t0 = time.time()
+    roots = []
+    for root_path, display_name in config["watch_roots"]:
+        if not os.path.exists(root_path):
+            print(f"Warning: root not found: {root_path}", file=sys.stderr)
+            continue
+        node = scan_root(root_path, display_name, config, include_sizes)
+        if node:
+            roots.append(node)
+
+    elapsed = time.time() - t0
+    output = {
+        "version": "1.0",
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "scan_duration_s": round(elapsed, 2),
+        "scan_config": {
+            "max_depth": config["max_depth"],
+            "skip_names": sorted(config["skip_names"]),
+            "project_markers": sorted(config["project_markers"]),
+            "data_patterns": sorted(config["data_patterns"]),
+        },
+        "roots": roots,
+    }
+
+    json_str = json.dumps(output, ensure_ascii=False, indent=2)
+    out_path = getattr(args, 'output', None) or RAW_PATH
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(json_str)
+        f.write("\n")
+    print(f"Raw JSON written to {out_path}", file=sys.stderr)
+    node_count = sum(1 for _ in json_str.splitlines())
+    print(f"  {len(roots)} roots, {node_count} lines, {elapsed:.1f}s", file=sys.stderr)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Annotate + Corrections
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def apply_correction(node, corrections):
+    override = corrections.get(node.get('path', ''))
+    if not override:
+        return
+    for field in ('type', 'category', 'description', 'highlight'):
+        if field in override:
+            node[field] = override[field]
+
+
+def annotate_node(node, desc_map, highlights, corrections):
+    name = node.get('name', '')
+    path = node.get('path', '')
+    is_symlink = node.get('is_symlink', False)
+    markers_found = node.get('markers_found', [])
+    depth = node.get('depth', 0)
+    children = node.get('children')
+
+    if depth == 0:
+        ntype = 'root'
+    elif is_symlink:
+        ntype = 'symlink'
+    elif markers_found and any(m in markers_found for m in
+            ['.git', 'pyproject.toml', 'package.json', 'Cargo.toml', 'go.mod', 'SKILL.md']):
+        ntype = 'project'
+    elif name in ('models', 'cache', 'data', 'checkpoints', 'runs', 'output'):
+        ntype = 'data'
+    elif children:
+        ntype = 'container'
+    else:
+        ntype = 'data'
+
+    if name in ('infoproc', 'cnn') and ntype == 'container':
+        ntype = 'workspace'
+
+    if ntype == 'root':
+        cat = 'root'
+    elif is_symlink or ntype == 'symlink':
+        cat = 'symlink'
+    elif name.startswith('.') and depth <= 1:
+        cat = 'config' if name in ('.claude', '.config') else 'infra'
+    elif 'bin' in path or name == 'bin':
+        cat = 'tools'
+    elif 'tool' in path.lower() or 'skill' in path.lower():
+        cat = 'tools'
+    elif 'learn' in path.lower() or 'course' in path.lower():
+        cat = 'learn'
+    elif 'archive' in path.lower():
+        cat = 'archive'
+    elif 'model' in path.lower() or name in ('models', 'data', 'cache',
+                                              'checkpoints', 'runs', 'output'):
+        cat = 'data'
+    elif name in ('Documents', 'notes', 'Downloads', 'snap', 'software',
+                  'opt', 'tmp', 'nltk_data', 'code'):
+        cat = 'infra'
+    elif name in ('.bashrc', '.profile', '.shinit', '.toolrc', '.gitconfig',
+                  '.condarc', 'CLAUDE.md', 'PROJECT-TREE.md', 'HOME-MAP.md'):
+        cat = 'config'
+    elif name in ('shezhen', 'sam_plus', 'sam_run', 'sam_train', 'sheall',
+                  'test', 'yolo_sam', 'YOLO_plus'):
+        cat = 'project'
+    elif ntype == 'project':
+        cat = 'project'
+    else:
+        cat = 'infra'
+
+    node['type'] = ntype
+    node['category'] = cat
+    node['description'] = desc_map.get(name, '')
+    node['highlight'] = name in highlights
+    apply_correction(node, corrections)
+
+    if children:
+        for child in children:
+            annotate_node(child, desc_map, highlights, corrections)
+
+
+def cmd_annotate(args):
+    desc_map, highlights = load_descriptions(getattr(args, 'descriptions_file', DESCRIPTIONS_PATH))
+    corrections = load_corrections(getattr(args, 'corrections_file', CORRECTIONS_PATH))
+    data = load_json(getattr(args, 'input', None) or RAW_PATH)
+
+    for root in data.get('roots', []):
+        annotate_node(root, desc_map, highlights, corrections)
+
+    data['annotated_at'] = time.strftime('%Y-%m-%dT%H:%M:%S')
+    provenance = 'claude-heuristics + descriptions.json'
+    if corrections:
+        provenance += f' + {len(corrections)} corrections'
+    data['annotated_by'] = provenance
+
+    out_path = getattr(args, 'output', None) or ANNOTATED_PATH
+    with open(out_path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    print(f"Annotated JSON written to {out_path}", file=sys.stderr)
+    if corrections:
+        print(f"  {len(corrections)} correction(s) applied", file=sys.stderr)
+
+
+def cmd_corrections(args):
+    corrections = load_corrections(getattr(args, 'corrections_file', CORRECTIONS_PATH))
+    data = load_json(args.input)
+
+    if not corrections:
+        print("No corrections to apply (empty or missing file)", file=sys.stderr)
+        with open(args.output, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        return
+
+    nodes = {}
+    for root in data.get('roots', []):
+        collect_paths(root, nodes)
+
+    applied, stale = 0, 0
+    for path, override in corrections.items():
+        if path not in nodes:
+            print(f"Warning: stale override for {path}", file=sys.stderr)
+            stale += 1
+            continue
+        for field in ('type', 'category', 'description', 'highlight'):
+            if field in override:
+                nodes[path][field] = override[field]
+        applied += 1
+
+    data['corrected_at'] = time.strftime('%Y-%m-%dT%H:%M:%S')
+    data['corrections_applied'] = applied
+    with open(args.output, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    print(f"Applied {applied} correction(s) to {args.output}", file=sys.stderr)
+    if stale:
+        print(f"  {stale} stale override(s) skipped", file=sys.stderr)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Diff
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def node_signature(node):
+    return {
+        'is_symlink': node.get('is_symlink', False),
+        'symlink_target': node.get('symlink_target'),
+        'has_project_marker': node.get('has_project_marker', False),
+        'markers_found': sorted(node.get('markers_found', [])),
+        'children_count': node.get('children_count', 0),
+        'depth': node.get('depth', 0),
+    }
+
+
+def classify_change(old_sig, new_sig):
+    if old_sig is None: return 'added'
+    if new_sig is None: return 'removed'
+    if old_sig['is_symlink'] != new_sig['is_symlink']: return 'type_changed'
+    if old_sig['symlink_target'] != new_sig['symlink_target']: return 'type_changed'
+    if old_sig['has_project_marker'] != new_sig['has_project_marker']: return 'type_changed'
+    if old_sig['markers_found'] != new_sig['markers_found']: return 'type_changed'
+    if old_sig['children_count'] != new_sig['children_count']: return 'structure_changed'
+    return 'unchanged'
+
+
+def describe_node(node):
+    name = node.get('name', '?')
+    if node.get('is_symlink'): ntype = 'symlink'
+    elif node.get('has_project_marker'):
+        ntype = f"project ({', '.join(node.get('markers_found', []))})"
+    elif node.get('children_count', 0) > 0: ntype = 'container'
+    else: ntype = 'data'
+    return f'{name}/  ({ntype})'
+
+
+def compute_diff(baseline_data, current_data):
+    old_nodes, new_nodes = {}, {}
+    for root in baseline_data.get('roots', []):
+        collect_paths(root, old_nodes)
+    for root in current_data.get('roots', []):
+        collect_paths(root, new_nodes)
+
+    all_paths = set(old_nodes.keys()) | set(new_nodes.keys())
+    changes = []
+    for path in sorted(all_paths):
+        old, new = old_nodes.get(path), new_nodes.get(path)
+        ct = classify_change(node_signature(old) if old else None,
+                             node_signature(new) if new else None)
+        if ct != 'unchanged':
+            changes.append({
+                'path': path, 'type': ct, 'name': (new or old).get('name', '?'),
+                'old_signature': node_signature(old) if old else None,
+                'new_signature': node_signature(new) if new else None,
+            })
+    return {
+        'baseline_at': baseline_data.get('generated_at', '?'),
+        'current_at': current_data.get('generated_at', '?'),
+        'total_old': len(old_nodes), 'total_new': len(new_nodes),
+        'changes': changes,
+    }
+
+
+SYMBOLS = {'added': '+', 'removed': '-', 'type_changed': '~', 'structure_changed': '~'}
+
+
+def cmd_diff(args):
+    baseline = load_json(args.baseline)
+    current = load_json(args.current)
+    result = compute_diff(baseline, current)
+
+    if getattr(args, 'json', False):
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+
+    added = sum(1 for c in result['changes'] if c['type'] == 'added')
+    removed = sum(1 for c in result['changes'] if c['type'] == 'removed')
+    changed = sum(1 for c in result['changes'] if c['type'] in ('type_changed', 'structure_changed'))
+    unchanged = result['total_new'] - added - changed
+
+    if getattr(args, 'summary', False):
+        print(f"Summary: {added} added, {removed} removed, {changed} changed, {unchanged} unchanged")
+        return
+
+    print(f"=== {result['baseline_at']} -> {result['current_at']} ===")
+    print()
+    for c in result['changes']:
+        sym = SYMBOLS.get(c['type'], '?')
+        if c['type'] == 'added':
+            node = {'name': c['name'], 'is_symlink': c['new_signature']['is_symlink'],
+                    'has_project_marker': c['new_signature']['has_project_marker'],
+                    'markers_found': c['new_signature']['markers_found'],
+                    'children_count': c['new_signature']['children_count']}
+            print(f"  {sym} ADDED     {c['path']}  {describe_node(node)}")
+        elif c['type'] == 'removed':
+            print(f"  {sym} REMOVED   {c['path']}")
+        elif c['type'] == 'type_changed':
+            old_n = {'name': c['name'], 'is_symlink': c['old_signature']['is_symlink'],
+                     'has_project_marker': c['old_signature']['has_project_marker'],
+                     'markers_found': c['old_signature']['markers_found'],
+                     'children_count': c['old_signature']['children_count']}
+            new_n = {'name': c['name'], 'is_symlink': c['new_signature']['is_symlink'],
+                     'has_project_marker': c['new_signature']['has_project_marker'],
+                     'markers_found': c['new_signature']['markers_found'],
+                     'children_count': c['new_signature']['children_count']}
+            print(f"  {sym} CHANGED   {c['path']}")
+            print(f"              {describe_node(old_n)} -> {describe_node(new_n)}")
+        elif c['type'] == 'structure_changed':
+            old_cc, new_cc = c['old_signature']['children_count'], c['new_signature']['children_count']
+            delta = new_cc - old_cc
+            delta_str = f'+{delta}' if delta > 0 else str(delta)
+            print(f"  {sym} CHANGED   {c['path']}  ({old_cc} -> {new_cc} children, {delta_str})")
+    print()
+    print(f"Summary: {added} added, {removed} removed, {changed} changed, {unchanged} unchanged")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Render (ThemeManager, NodeLoader, Renderers)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+if HAS_RICH:
+    class ThemeManager:
+        def __init__(self, theme_name="dracula"):
+            self.theme_name = theme_name
+            self.data = load_json(THEMES_PATH)
+            self.colors = {}
+            self.styles = {}
+            self.indicators = {}
+            self.tui = {}
+            for t in self.data.values():
+                if t.get('name', '').lower() == theme_name.lower():
+                    self.colors = t.get('colors', {})
+                    self.styles = t.get('styles', {})
+                    self.indicators = t.get('indicators', {})
+                    self.tui = t.get('tui', {})
+                    break
+            if not self.colors:
+                first = list(self.data.values())[0] if self.data else {}
+                self.colors = first.get('colors', {})
+                self.styles = first.get('styles', {})
+                self.indicators = first.get('indicators', {})
+                self.tui = first.get('tui', {})
+
+        def category_style(self, category):
+            s = self.colors.get(category, '')
+            return Style.parse(s) if s else Style()
+
+        def style(self, key):
+            s = self.styles.get(key, '')
+            return Style.parse(s) if s else Style()
+
+        def indicator_style(self, state='collapsed'):
+            s = self.indicators.get(state) or 'white'
+            return Style.parse(s)
+
+        def tui_style(self, key):
+            s = self.tui.get(key) or 'white'
+            return Style.parse(s)
+
+        @classmethod
+        def list_themes(cls):
+            try:
+                data = load_json(THEMES_PATH)
+            except Exception:
+                return []
+            result = []
+            for key, t in data.items():
+                result.append((key, t.get('name', key), t.get('description', '')))
+            return result
+
+
+    class NodeLoader:
+        def __init__(self, json_path=ANNOTATED_PATH):
+            self.data = load_json(json_path)
+            self.roots = self.data.get('roots', [])
+
+        def load(self):
+            return self.roots
+
+        def get_stats(self):
+            nodes = []
+            for root in self.roots:
+                nodes.extend(walk_nodes(root))
+            projects = sum(1 for n in nodes if n.get('type') == 'project')
+            workspaces = sum(1 for n in nodes if n.get('type') == 'workspace')
+            data_nodes = sum(1 for n in nodes if n.get('type') == 'data')
+            containers = sum(1 for n in nodes if n.get('type') == 'container')
+            symlinks = sum(1 for n in nodes if n.get('is_symlink'))
+            roots_count = sum(1 for n in nodes if n.get('depth') == 0)
+            return {
+                'roots': roots_count, 'total_nodes': len(nodes),
+                'projects': projects, 'workspaces': workspaces,
+                'data_nodes': data_nodes, 'containers': containers,
+                'symlinks': symlinks,
+            }
+
+
+    class TreeRenderer:
+        def __init__(self, theme, show_size=True, show_desc=True, compact=False):
+            self.theme = theme
+            self.show_size = show_size
+            self.show_desc = show_desc
+            self.compact = compact
+
+        def render(self, roots):
+            tree = None
+            for root in roots:
+                root_tree = self._build_tree(root)
+                if tree is None:
+                    tree = root_tree
+                else:
+                    tree.add(root_tree)
+            return tree
+
+        def _build_tree(self, node):
+            label = self._make_label(node)
+            tree = Tree(label, guide_style=self.theme.style("guide"))
+            for child in (node.get('children') or []):
+                subtree = self._build_tree(child)
+                tree.add(subtree)
+            return tree
+
+        def _make_label(self, node):
+            name = node.get('name', '')
+            ntype = node.get('type', '')
+            is_symlink = node.get('is_symlink', False)
+            symlink_target = node.get('symlink_target')
+            description = node.get('description', '')
+            highlight = node.get('highlight', False)
+            size = node.get('size')
+            category = node.get('category', '')
+
+            style = self.theme.category_style(category)
+            if highlight and not is_symlink:
+                style = Style.combine([style, Style(bold=True, reverse=True)])
+
+            display = name
+            if ntype == 'annotation':
+                display = f'═══ {name} ═══'
+            elif is_symlink or ntype == 'symlink':
+                display = f'{name}'
+                if symlink_target:
+                    display += f' -> {symlink_target}'
+                style = Style.combine([style, Style(underline=True)])
+            elif ntype in ('container', 'project', 'workspace', 'data'):
+                display = f'{name}/'
+
+            text = Text(display, style=style)
+
+            if self.show_size and size:
+                text.append(f'  ({size})', style=self.theme.style('size'))
+            if self.show_desc and description and not self.compact:
+                text.append(f'  \N{LEFTWARDS ARROW} {description}',
+                           style=self.theme.style('description'))
+
+            return text
+
+
+    class SplitRenderer:
+        """Tree (left) + compact stats (right), TTY-aware."""
+
+        def __init__(self, theme, show_size=True):
+            self.theme = theme
+            self.show_size = show_size
+
+        def render(self, roots):
+            if not sys.stdout.isatty():
+                return self._render_piped(roots)
+            return self._render_layout(roots)
+
+        def _render_layout(self, roots):
+            tree_renderer = TreeRenderer(self.theme, show_size=self.show_size,
+                                          show_desc=True, compact=False)
+            tree = tree_renderer.render(roots)
+            tree_panel = Panel(tree, title="[bold]Project Tree[/]",
+                               border_style=self.theme.style("border"),
+                               box=box.ROUNDED, padding=(0, 1))
+
+            right_layout = Layout()
+            right_layout.split_column(
+                Layout(self._build_stats_panel(roots), ratio=1),
+                Layout(self._build_legend_panel(), ratio=1),
+            )
+
+            layout = Layout()
+            layout.split_row(
+                Layout(tree_panel, ratio=3),
+                Layout(right_layout, ratio=2),
+            )
+            return layout
+
+        def _render_piped(self, roots):
+            """Pipe mode: compact stats header + full tree (for less -R)."""
+            parts = []
+            stats = self._collect_stats(roots)
+            parts.append(f"[bold]Project Tree[/] — {stats['total_nodes']} nodes, "
+                         f"{stats['projects']} projects, {stats['data_nodes']} data, "
+                         f"{stats['symlinks']} symlinks")
+            parts.append("")
+
+            tree_renderer = TreeRenderer(self.theme, show_size=self.show_size,
+                                          show_desc=True, compact=False)
+            parts.append(tree_renderer.render(roots))
+            return parts
+
+        def _collect_stats(self, roots):
+            nodes = []
+            for root in roots:
+                nodes.extend(walk_nodes(root))
+            return {
+                'total_nodes': len(nodes),
+                'projects': sum(1 for n in nodes if n.get('type') == 'project'),
+                'workspaces': sum(1 for n in nodes if n.get('type') == 'workspace'),
+                'data_nodes': sum(1 for n in nodes if n.get('type') == 'data'),
+                'containers': sum(1 for n in nodes if n.get('type') == 'container'),
+                'symlinks': sum(1 for n in nodes if n.get('is_symlink')),
+                'roots': sum(1 for n in nodes if n.get('depth') == 0),
+                'highlights': sum(1 for n in nodes if n.get('highlight')),
+                'with_desc': sum(1 for n in nodes if n.get('description')),
+            }
+
+        def _build_stats_panel(self, roots):
+            s = self._collect_stats(roots)
+            desc_pct = s['with_desc'] / max(s['total_nodes'], 1) * 100
+            table = Table(title="Overview", title_style=self.theme.style("panel_title"),
+                          box=box.SIMPLE, border_style=self.theme.style("stats_border"),
+                          expand=True)
+            table.add_column("Metric", style="bold")
+            table.add_column("Value", justify="right")
+            for metric, value in [
+                ("Nodes", s['total_nodes']), ("Roots", s['roots']),
+                ("Projects", s['projects']), ("Workspaces", s['workspaces']),
+                ("Data", s['data_nodes']), ("Containers", s['containers']),
+                ("Symlinks", s['symlinks']),
+                (f"★ Highlighted", s['highlights']),
+                (f"Described", f"{s['with_desc']}/{s['total_nodes']} ({desc_pct:.0f}%)"),
+            ]:
+                table.add_row(metric, str(value))
+            return Panel(table, border_style=self.theme.style("border"),
+                         box=box.ROUNDED, padding=(0, 1))
+
+        def _build_legend_panel(self):
+            table = Table(title="Legend", title_style=self.theme.style("panel_title"),
+                          box=box.SIMPLE, border_style=self.theme.style("stats_border"),
+                          expand=True)
+            table.add_column("", width=3)
+            table.add_column("Category")
+            for cat, label in [
+                ("tools", "Tools / Scripts"), ("project", "Projects"),
+                ("workspace", "Workspaces"), ("data", "Data / Models"),
+                ("learn", "Learning"), ("archive", "Archive"),
+                ("infra", "Infrastructure"), ("config", "Config"),
+                ("symlink", "Symlink"),
+            ]:
+                swatch = Text("■", style=self.theme.category_style(cat))
+                table.add_row(swatch, label)
+            return Panel(table, border_style=self.theme.style("border"),
+                         box=box.ROUNDED, padding=(0, 1))
+
+
+    class TableRenderer:
+        def __init__(self, theme):
+            self.theme = theme
+
+        def render(self, roots):
+            table = Table(title="Project Tree — Table View",
+                          border_style=self.theme.style("border"),
+                          box=box.ROUNDED, expand=True)
+            table.add_column("Name", style="bold")
+            table.add_column("Size", style=self.theme.style("size"))
+            table.add_column("Type")
+            table.add_column("Category")
+            table.add_column("Description", style=self.theme.style("description"))
+
+            nodes = []
+            for root in roots:
+                self._flatten(root, nodes)
+
+            for i, n in enumerate(nodes):
+                depth = n.get('depth', 0)
+                is_last = n.get('_is_last', False)
+                indent = self._indent_prefix(depth, is_last)
+                name = n.get('name', '')
+                ntype = n.get('type', '')
+                display = name
+                if n.get('is_symlink'):
+                    display = f"{name} -> {n.get('symlink_target', '')}"
+                elif ntype in ('container', 'project', 'workspace', 'data'):
+                    display = f"{name}/"
+                style = self.theme.category_style(n.get('category', ''))
+                table.add_row(
+                    Text(f"{indent}{display}", style=style),
+                    n.get('size') or '—',
+                    f"  {self._type_icon(ntype)} {ntype}",
+                    n.get('category', ''),
+                    n.get('description', ''),
+                )
+            return table
+
+        def _flatten(self, node, acc, depth=0):
+            node['_depth_flat'] = depth
+            acc.append(node)
+            children = node.get('children') or []
+            for i, child in enumerate(children):
+                child['_is_last'] = (i == len(children) - 1)
+                self._flatten(child, acc, depth + 1)
+
+        def _indent_prefix(self, depth, is_last):
+            if depth == 0:
+                return ''
+            parts = []
+            for d in range(depth - 1):
+                parts.append('│   ')
+            parts.append('└── ' if is_last else '├── ')
+            return ''.join(parts)
+
+        def _type_icon(self, ntype):
+            icons = {'root': '\U0001f3e0', 'container': '\U0001f4c1',
+                     'project': '\U0001f4e6', 'workspace': '\U0001f3ed',
+                     'data': '\U0001f4be', 'symlink': '\U0001f517'}
+            return icons.get(ntype, '  ')
+
+
+    class DashboardRenderer:
+        def __init__(self, theme):
+            self.theme = theme
+
+        def render(self, roots):
+            tree_renderer = TreeRenderer(self.theme, show_size=True, show_desc=False, compact=True)
+            tree = tree_renderer.render(roots)
+            tree_panel = Panel(tree, title="[bold]Project Tree[/]",
+                               border_style=self.theme.style("border"),
+                               box=box.ROUNDED, padding=(0, 1))
+
+            loader = NodeLoader.__new__(NodeLoader)
+            loader.roots = roots
+            stats = loader.get_stats()
+            stats_table = Table(title="Summary", title_style=self.theme.style("panel_title"),
+                                box=box.SIMPLE, border_style=self.theme.style("stats_border"),
+                                expand=True)
+            stats_table.add_column("Metric", style="bold")
+            stats_table.add_column("Value", justify="right")
+            for metric, value in [
+                ("Watch Roots", stats['roots']), ("Total Nodes", stats['total_nodes']),
+                ("Projects", stats['projects']), ("Workspaces", stats['workspaces']),
+                ("Data Nodes", stats['data_nodes']), ("Containers", stats['containers']),
+                ("Symlinks", stats['symlinks']),
+            ]:
+                stats_table.add_row(metric, str(value))
+            stats_panel = Panel(stats_table, border_style=self.theme.style("border"),
+                                box=box.ROUNDED, padding=(0, 1))
+
+            legend_table = Table(title="Category Legend",
+                                 title_style=self.theme.style("panel_title"),
+                                 box=box.SIMPLE, border_style=self.theme.style("stats_border"),
+                                 expand=True)
+            legend_table.add_column("", width=3)
+            legend_table.add_column("Category")
+            for cat, label in [
+                ("tools", "Tools / Scripts"), ("project", "Projects"),
+                ("workspace", "Workspaces"), ("data", "Data / Models"),
+                ("learn", "Learning"), ("archive", "Archive / Backup"),
+                ("infra", "Infrastructure"), ("config", "Config Files"),
+            ]:
+                swatch = Text("■", style=self.theme.category_style(cat))
+                legend_table.add_row(swatch, label)
+            legend_panel = Panel(legend_table, border_style=self.theme.style("border"),
+                                 box=box.ROUNDED, padding=(0, 1))
+
+            right_layout = Layout()
+            right_layout.split_column(
+                Layout(stats_panel, ratio=1),
+                Layout(legend_panel, ratio=1),
+            )
+            layout = Layout()
+            layout.split_row(
+                Layout(tree_panel, ratio=3),
+                Layout(right_layout, ratio=2),
+            )
+            return layout
+
+
+    class MarkdownRenderer:
+        def __init__(self, source_json_path=""):
+            self.source = source_json_path
+
+        def render(self, roots):
+            lines = [
+                "<!-- GENERATED from annotated JSON. DO NOT EDIT DIRECTLY. -->",
+                f"<!-- last-verified: {time.strftime('%Y-%m-%dT%H:%M:%S')} | status: current -->",
+                "", "# 服务器项目树", "",
+                f"生成时间：{time.strftime('%Y-%m-%d')}",
+                "更新策略：按项目颗粒度动态终止，不按固定目录深度", "",
+            ]
+            for i, root in enumerate(roots):
+                lines.extend(self._render_root_section(root))
+                if i < len(roots) - 1:
+                    lines.extend(["", "---", ""])
+            lines.extend(["", "---", "", "## 颗粒度规则", "",
+                "| 终止条件 | 示例 |",
+                "|----------|------|",
+                "| 独立项目/工具（有 .git/setup.py/SKILL.md） "
+                "| `baidupan-tools/`、`knowledge-network-system/` |",
+                "| 自洽工作区（内部是工作流部件，不是独立项目） "
+                "| `infoproc/`（输入 + 产出 + 模型 + 外部源码） |",
+                "| 纯数据/模型/缓存 | `models/`、`promptskill-router/` (顶层) |",
+                "| 容器目录 | `tools/`、`cnn/shezhen/` → 继续展开 |",
+                "", "## 更新说明", "",
+                "此文件由 `project-tree render md` 从 annotated JSON 生成。",
+                "自动管线: scan → annotate → render md。",
+                f"数据源: `{self.source}`",
+            ])
+            return "\n".join(lines) + "\n"
+
+        def _render_root_section(self, root):
+            name = root.get("display_name") or root.get("name", "")
+            path = root.get("path", "")
+            display = f"{name}  ({path})" if path else name
+            desc = root.get("description", "")
+            title = display + (f"   ← {desc}" if desc else "")
+            lines = ["```", title]
+            children = root.get("children") or []
+            for i, child in enumerate(children):
+                lines.extend(self._render_node(child, "", i == len(children) - 1, 0))
+            lines.append("```")
+            return lines
+
+        def _render_node(self, node, prefix, is_last, depth):
+            lines = []
+            connector = "└── " if is_last else "├── "
+            name, ntype = node.get("name", ""), node.get("type", "")
+            size, is_symlink = node.get("size"), node.get("is_symlink", False)
+            symlink_target = node.get("symlink_target")
+            description, highlight = node.get("description", ""), node.get("highlight", False)
+
+            if ntype == "annotation":
+                display = f"═══ {name} ═══"
+            elif is_symlink or ntype == "symlink":
+                display = f"{name} → {symlink_target or ''}"
+                if description:
+                    display += f"    ({description})"
+            elif ntype in ("container", "project", "workspace", "data"):
+                display = f"{name}/"
+            else:
+                display = name
+
+            extras = []
+            if highlight: extras.append("★")
+            if size: extras.append(f"({size})")
+            if description and ntype != "symlink":
+                extras.append(f"← {description}")
+            comment = node.get("comment", "")
+            if comment: extras.append(f"# {comment}")
+
+            line = f"{prefix}{connector}{display}"
+            if extras:
+                line += "  " + "  ".join(extras)
+            lines.append(line)
+
+            children = node.get("children") or []
+            child_prefix = prefix + ("    " if is_last else "│   ")
+            for i, child in enumerate(children):
+                lines.extend(self._render_node(child, child_prefix,
+                                                i == len(children) - 1, depth + 1))
+            return lines
+
+        def write(self, roots, output_path):
+            with open(output_path, "w", encoding="utf-8") as f:
+                f.write(self.render(roots))
+            return output_path
+
+
+    def cmd_render(args):
+        if not os.path.exists(args.input):
+            print(f"Error: input file not found: {args.input}", file=sys.stderr)
+            print("Run 'project-tree scan' first, then 'project-tree annotate'.", file=sys.stderr)
+            sys.exit(1)
+
+        theme = ThemeManager(theme_name=args.theme)
+        loader = NodeLoader(args.input)
+        roots = loader.load()
+        console = Console()
+
+        show_size = not getattr(args, 'no_size', False)
+        compact = getattr(args, 'compact', False)
+        mode = args.mode or 'split'
+
+        if mode == 'tree':
+            renderer = TreeRenderer(theme, show_size=show_size, compact=compact)
+            console.print(renderer.render(roots))
+        elif mode == 'table':
+            console.print(TableRenderer(theme).render(roots))
+        elif mode == 'dash':
+            console.print(DashboardRenderer(theme).render(roots))
+        elif mode == 'split':
+            renderer = SplitRenderer(theme, show_size=show_size)
+            result = renderer.render(roots)
+            if isinstance(result, list):
+                console.print(*result)
+            else:
+                console.print(result)
+        elif mode == 'md':
+            renderer = MarkdownRenderer(source_json_path=args.input)
+            out_path = args.output or MD_OUTPUT
+            renderer.write(roots, out_path)
+            print(f"Markdown written to {out_path}")
+        else:
+            print(f"Unknown mode: {mode}", file=sys.stderr)
+            sys.exit(1)
+else:
+    def cmd_render(args):
+        print("Error: 'rich' library required for rendering. Install: pip install rich",
+              file=sys.stderr)
+        sys.exit(1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Textual TUI
+# ═══════════════════════════════════════════════════════════════════════════════
+
+try:
+    from textual.app import App, ComposeResult
+    from textual.widgets import Tree as TTree, Static, Header, Footer, Input
+    from textual.containers import Horizontal, Vertical, Container
+    from textual.binding import Binding
+    from textual.widgets.tree import TreeNode
+    HAS_TEXTUAL = True
+except ImportError:
+    HAS_TEXTUAL = False
+
+
+if HAS_TEXTUAL and HAS_RICH:
+
+    class DetailPanel(Static):
+        """Right panel: stats overview or node details."""
+
+        def show_stats(self, stats, theme):
+            s = stats
+            desc_pct = s['with_desc'] / max(s['total_nodes'], 1) * 100
+            lines = [
+                f"[{theme.tui_style('panel_title')}]  Server Project Tree  [/]",
+                "",
+                f"  [{theme.tui_style('stats_number')}]{s['total_nodes']:>6}[/]  [{theme.tui_style('stats_label')}]Nodes[/]",
+                f"  [{theme.tui_style('stats_number')}]{s['projects']:>6}[/]  [{theme.tui_style('stats_label')}]Projects[/]",
+                f"  [{theme.tui_style('stats_number')}]{s['data_nodes']:>6}[/]  [{theme.tui_style('stats_label')}]Data[/]",
+                f"  [{theme.tui_style('stats_number')}]{s['containers']:>6}[/]  [{theme.tui_style('stats_label')}]Containers[/]",
+                f"  [{theme.tui_style('stats_number')}]{s['symlinks']:>6}[/]  [{theme.tui_style('stats_label')}]Symlinks[/]",
+                f"  [{theme.tui_style('stats_number')}]{s['highlights']:>6}[/]  [{theme.tui_style('stats_label')}]Highlighted[/]",
+                "",
+                f"  [{theme.tui_style('detail_label')}]Described:[/] {s['with_desc']}/{s['total_nodes']} ({desc_pct:.0f}%)",
+            ]
+            self.update("\n".join(lines))
+
+        def show_detail(self, node, theme):
+            name = node.get('name', '')
+            path = node.get('path', '')
+            ntype = node.get('type', '?')
+            category = node.get('category', '?')
+            size = node.get('size') or '—'
+            description = node.get('description', '')
+            highlight = node.get('highlight', False)
+            is_symlink = node.get('is_symlink', False)
+            symlink_target = node.get('symlink_target', '')
+            markers = node.get('markers', [])
+            depth = node.get('depth', 0)
+            children_count = len(node.get('children') or [])
+
+            cat_style = theme.category_style(category)
+            hl_mark = ' ★' if highlight else ''
+
+            display_name = name
+            if ntype in ('container', 'project', 'workspace', 'data'):
+                display_name += '/'
+
+            lines = [
+                f"  [{cat_style}]{display_name}[/]{hl_mark}",
+                "",
+                f"  [{theme.tui_style('detail_label')}]Path:[/]      [{theme.tui_style('detail_value')}]{path}[/]",
+                f"  [{theme.tui_style('detail_label')}]Type:[/]      [{theme.tui_style('detail_value')}]{ntype}[/]",
+                f"  [{theme.tui_style('detail_label')}]Category:[/]   [{cat_style}]{category}[/]",
+                f"  [{theme.tui_style('detail_label')}]Size:[/]       [{theme.tui_style('detail_value')}]{size}[/]",
+                f"  [{theme.tui_style('detail_label')}]Depth:[/]      [{theme.tui_style('detail_value')}]{depth}[/]",
+                f"  [{theme.tui_style('detail_label')}]Children:[/]   [{theme.tui_style('detail_value')}]{children_count}[/]",
+            ]
+            if markers:
+                lines.append(f"  [{theme.tui_style('detail_label')}]Markers:[/]    [{theme.tui_style('detail_value')}]{', '.join(markers)}[/]")
+            if is_symlink and symlink_target:
+                lines.append(f"  [{theme.tui_style('detail_label')}]Symlink:[/]    [{theme.tui_style('detail_value')}]{symlink_target}[/]")
+            if description:
+                lines.append(f"")
+                lines.append(f"  [{theme.style('description')}]{description}[/]")
+            self.update("\n".join(lines))
+
+
+    class ProjectTreeTUI(App):
+        """Interactive server project tree explorer — dual-color model."""
+
+        CSS = """
+        #tree-panel {
+            width: 2fr;
+            border: solid $primary;
+            background: $surface;
+        }
+        #detail-panel {
+            width: 1fr;
+            border: solid $primary;
+            background: $surface;
+            padding: 1;
+        }
+        #search-input {
+            dock: top;
+            margin: 1;
+            width: 40;
+        }
+        #depth-badge {
+            dock: bottom;
+            height: 1;
+            content-align: center middle;
+        }
+        Tree > .tree--guides {
+            color: $text-disabled;
+        }
+        Tree:focus > .tree--cursor {
+            background: $accent 30%;
+        }
+        """
+
+        BINDINGS = [
+            Binding("q", "quit", "Quit"),
+            Binding("up", "cursor_up", "Up"),
+            Binding("down", "cursor_down", "Down"),
+            Binding("enter", "toggle_node", "Expand/Collapse"),
+            Binding("space", "toggle_node", "Expand/Collapse"),
+            Binding("d", "cycle_depth", "Depth +"),
+            Binding("s", "cycle_depth_reverse", "Depth -"),
+            Binding("t", "zoom_in", "Zoom In"),
+            Binding("r", "zoom_out", "Zoom Out"),
+            Binding("e", "enter_dir", "Enter Dir"),
+            Binding("f", "search_mode", "Find"),
+            Binding("escape", "clear_search", "Clear"),
+            Binding("g", "scroll_home", "Home"),
+            Binding("G", "scroll_end", "End"),
+        ]
+
+        def __init__(self, annotated_path=None, theme_name="dracula",
+                     max_depth=4, display_depth=None):
+            super().__init__()
+            self.annotated_path = annotated_path or ANNOTATED_PATH
+            self.theme_name = theme_name
+            self.max_depth = max_depth
+            self.display_depth = display_depth if display_depth is not None else max(1, max_depth - 1)
+            self.search_active = False
+            self._all_node_data = []
+            self._zoom_stack = []  # stack of (roots_data, display_depth) for zoom-out
+
+        def compose(self) -> ComposeResult:
+            yield Header()
+            with Horizontal():
+                yield TTree("Loading...", id="tree-panel")
+                yield DetailPanel(id="detail-panel")
+            yield Footer()
+
+        def on_mount(self):
+            self.pt_theme = ThemeManager(self.theme_name)
+            self._load_data()
+
+        def _load_data(self):
+            if not os.path.exists(self.annotated_path):
+                self.query_one("#tree-panel", TTree).root.set_label(
+                    f"No data found. Run: project-tree update")
+                return
+            try:
+                data = load_json(self.annotated_path)
+            except Exception as e:
+                self.query_one("#tree-panel", TTree).root.set_label(f"Error: {e}")
+                return
+
+            self._all_node_data = []
+            for root_node in data.get('roots', []):
+                self._all_node_data.extend(walk_nodes(root_node))
+            self.roots_data = data.get('roots', [])
+            self._populate_tree()
+            self._show_stats()
+
+        def _populate_tree(self):
+            tree = self.query_one("#tree-panel", TTree)
+            tree.clear()
+            tree.root.set_label(Text.from_markup("[bold]Server Project Tree[/]"))
+
+            for root_data in self.roots_data:
+                label = self._make_node_label(root_data, is_collapsed=bool(root_data.get('children')))
+                root_node = tree.root.add(label, expand=True)
+                root_node.data = root_data
+
+                for child in (root_data.get('children') or []):
+                    self._add_tree_node(root_node, child, 1)
+
+            tree.focus()
+
+        def _add_tree_node(self, parent, node_data, depth):
+            children = node_data.get('children') or []
+            has_children = bool(children)
+            show_children = has_children and depth < self.display_depth
+
+            label = self._make_node_label(node_data, is_collapsed=has_children)
+            tree_node = parent.add(label, expand=False)
+            tree_node.data = node_data
+
+            if show_children:
+                for child in children:
+                    self._add_tree_node(tree_node, child, depth + 1)
+
+        def _make_node_label(self, node_data, is_collapsed=True):
+            name = node_data.get('name', '')
+            ntype = node_data.get('type', '')
+            category = node_data.get('category', '')
+            description = node_data.get('description', '')
+            has_children = bool(node_data.get('children'))
+
+            indicator = ''
+            if has_children or ntype in ('container', 'root'):
+                state = 'collapsed' if is_collapsed else 'expanded'
+                s = self.pt_theme.indicators.get(state, 'bold white')
+                sym = '[+] ' if is_collapsed else '[-] '
+                indicator = f'[{s}]{sym}[/]'
+
+            display_name = name
+            if ntype in ('container', 'project', 'workspace', 'data'):
+                display_name += '/'
+
+            cat_s = self.pt_theme.colors.get(category) or 'white'
+            name_part = f'[{cat_s}]{display_name}[/]'
+
+            parts = [indicator, name_part] if indicator else [name_part]
+
+            if description:
+                desc_s = self.pt_theme.styles.get('description') or 'italic'
+                parts.append(f'  [{desc_s}]\N{LEFTWARDS ARROW} {description}[/]')
+
+            return Text.from_markup(''.join(parts))
+
+        def on_tree_node_expanded(self, event: TTree.NodeExpanded):
+            node = event.node
+            if node.data:
+                node_data = node.data
+                # Update label: [+] → [-]
+                node.set_label(self._make_node_label(node_data, is_collapsed=False))
+                # Lazy-load children if not loaded (beyond display_depth)
+                if not node.children:
+                    for child in (node_data.get('children') or []):
+                        child_depth = node_data.get('depth', 0) + 1
+                        self._add_tree_node(node, child, child_depth)
+
+        def on_tree_node_collapsed(self, event: TTree.NodeCollapsed):
+            node = event.node
+            if node.data:
+                node.set_label(self._make_node_label(node.data, is_collapsed=True))
+
+        def on_tree_node_highlighted(self, event: TTree.NodeHighlighted):
+            node = event.node
+            panel = self.query_one("#detail-panel", DetailPanel)
+            if node.data:
+                panel.show_detail(node.data, self.pt_theme)
+            else:
+                self._show_stats()
+            # Scroll padding: keep cursor away from viewport top/bottom edges
+            tree = self.query_one("#tree-panel", TTree)
+            self._center_cursor(node)
+
+        def _center_cursor(self, node):
+            """Scroll so the highlighted node isn't at the very top or bottom edge."""
+            tree = self.query_one("#tree-panel", TTree)
+            tree.scroll_to_node(node, animate=False)
+            PAD = 4
+
+            def _nudge():
+                line = tree.cursor_line
+                if line is None:
+                    return
+                vh = tree.scrollable_content_region.height
+                sy = tree.scroll_offset.y
+                rel = line - sy
+                if rel < PAD and sy > 0:
+                    tree.scroll_to(y=max(0, line - PAD), animate=False)
+                elif rel > vh - PAD - 1:
+                    tree.scroll_to(y=max(0, line - vh + PAD + 1), animate=False)
+
+            self.call_after_refresh(_nudge)
+
+        def action_toggle_node(self):
+            tree = self.query_one("#tree-panel", TTree)
+            if tree.cursor_node is not None:
+                node = tree.cursor_node
+                if node.is_expanded:
+                    node.collapse()
+                else:
+                    node.expand()
+
+        def action_cycle_depth(self):
+            self.display_depth = (self.display_depth % self.max_depth) + 1
+            self._repopulate()
+            self._show_stats()
+            self.notify(f"Display depth: {self.display_depth}/{self.max_depth}",
+                       timeout=2)
+
+        def action_cycle_depth_reverse(self):
+            self.display_depth = ((self.display_depth - 2) % self.max_depth) + 1
+            self._repopulate()
+            self._show_stats()
+            self.notify(f"Display depth: {self.display_depth}/{self.max_depth}",
+                       timeout=2)
+
+        def action_enter_dir(self):
+            """Write selected path to last-cd file and quit."""
+            tree = self.query_one("#tree-panel", TTree)
+            node = tree.cursor_node
+            if node is None or not node.data:
+                self.notify("No node selected", timeout=2)
+                return
+
+            node_data = node.data
+            path = node_data.get('path', '')
+            ntype = node_data.get('type', '')
+
+            # If it's a file, use its parent dir
+            if ntype not in ('root', 'container', 'workspace', 'project') and not node_data.get('children'):
+                path = os.path.dirname(path)
+
+            if path and os.path.isdir(path):
+                last_cd = os.path.expanduser('~/.cache/project-tree-last-cd')
+                os.makedirs(os.path.dirname(last_cd), exist_ok=True)
+                with open(last_cd, 'w') as f:
+                    f.write(path)
+                self.exit()
+            else:
+                self.notify(f"Not a directory: {path}", timeout=2)
+
+        def action_zoom_in(self):
+            """Zoom into the selected node's subtree."""
+            tree = self.query_one("#tree-panel", TTree)
+            node = tree.cursor_node
+            if node is None or not node.data:
+                return
+
+            node_data = node.data
+            ntype = node_data.get('type', '')
+
+            # If it's a file/leaf, zoom to its parent
+            if ntype not in ('root', 'container', 'workspace', 'project') and not node_data.get('children'):
+                # Find parent by walking roots
+                parent_data = self._find_parent(node_data)
+                if parent_data:
+                    node_data = parent_data
+
+            children = node_data.get('children')
+            if not children:
+                self.notify("No children to zoom into", timeout=2)
+                return
+
+            # Push current state to zoom stack
+            self._zoom_stack.append((self.roots_data, self.display_depth))
+            # Set new roots
+            self.roots_data = [node_data]
+            self.display_depth = self.max_depth  # show all levels when zoomed in
+            self._repopulate()
+
+            name = node_data.get('name', '')
+            self.notify(f"Zoomed into: {name}/  (r to zoom out)", timeout=3)
+
+        def action_zoom_out(self):
+            """Zoom back out to previous view."""
+            if not self._zoom_stack:
+                self.notify("Already at top level", timeout=2)
+                return
+            self.roots_data, self.display_depth = self._zoom_stack.pop()
+            self._repopulate()
+            self.notify("Zoomed out", timeout=2)
+
+        def _find_parent(self, target_data):
+            """Find the parent node_data for a given node by walking all roots."""
+            target_path = target_data.get('path', '')
+            if not target_path:
+                return None
+            parent_path = os.path.dirname(target_path)
+
+            all_nodes = []
+            for root in self.roots_data:
+                all_nodes.extend(walk_nodes(root))
+            for n in all_nodes:
+                if n.get('path') == parent_path:
+                    return n
+            return None
+
+        def action_search_mode(self):
+            self.search_active = True
+            search_input = Input(placeholder="Search...", id="search-input")
+            self.mount(search_input)
+            search_input.focus()
+
+        def action_clear_search(self):
+            if self.search_active:
+                try:
+                    self.query_one("#search-input", Input).remove()
+                except Exception:
+                    pass
+                self.search_active = False
+                self._repopulate()
+                self._show_stats()
+                self.query_one("#tree-panel", TTree).focus()
+
+        def on_input_submitted(self, event: Input.Submitted):
+            if event.widget.id == "search-input":
+                self._apply_search(event.value)
+
+        def on_input_changed(self, event: Input.Changed):
+            if event.widget.id == "search-input":
+                if not event.value:
+                    self._repopulate()
+                else:
+                    self._apply_search(event.value)
+
+        def _apply_search(self, term):
+            if not term:
+                self._repopulate()
+                return
+            term_lower = term.lower()
+            tree = self.query_one("#tree-panel", TTree)
+            tree.clear()
+
+            for root_data in self.roots_data:
+                filtered = self._filter_tree(root_data, term_lower)
+                if filtered is not None:
+                    label = self._make_node_label(root_data, is_collapsed=False)
+                    root_node = tree.root.add(label, expand=True)
+                    root_node.data = root_data
+                    for child in (filtered.get('children') or []):
+                        self._add_tree_node(root_node, child, 0)
+                    root_node.expand()
+
+            self.notify(f"Search: '{term}' — matching nodes shown", timeout=2)
+
+        def _filter_tree(self, node_data, term_lower):
+            """Return node_data with filtered children if it or any descendant matches, else None."""
+            name = node_data.get('name', '').lower()
+            desc = (node_data.get('description') or '').lower()
+            self_matches = term_lower in name or term_lower in desc
+
+            children = node_data.get('children') or []
+            filtered_children = []
+            for child in children:
+                result = self._filter_tree(child, term_lower)
+                if result is not None:
+                    filtered_children.append(result)
+
+            if self_matches or filtered_children:
+                result = dict(node_data)
+                result['children'] = filtered_children
+                return result
+            return None
+
+        def _repopulate(self, restore_cursor=True):
+            # Save cursor path before clearing
+            cursor_path = None
+            if restore_cursor:
+                tree = self.query_one("#tree-panel", TTree)
+                if tree.cursor_node and tree.cursor_node.data:
+                    cursor_path = tree.cursor_node.data.get('path')
+
+            tree = self.query_one("#tree-panel", TTree)
+            tree.clear()
+            self._populate_tree()
+
+            if cursor_path:
+                self._restore_cursor(cursor_path)
+
+        def _restore_cursor(self, path):
+            """Find a node by path (or nearest ancestor) and move cursor to it."""
+            tree = self.query_one("#tree-panel", TTree)
+
+            def _find(node, target):
+                if node.data and node.data.get('path') == target:
+                    return node
+                for child in node.children:
+                    r = _find(child, target)
+                    if r:
+                        return r
+                return None
+
+            target = _find(tree.root, path)
+            # If exact path not found (depth reduced), walk up to nearest ancestor
+            while target is None and path and path != '/':
+                path = os.path.dirname(path)
+                target = _find(tree.root, path)
+
+            if target:
+                tree.select_node(target)
+                tree.scroll_to_node(target, animate=False)
+
+        def _show_stats(self):
+            nodes = self._all_node_data
+            if not nodes:
+                nodes = []
+                for root in self.roots_data:
+                    nodes.extend(walk_nodes(root))
+                self._all_node_data = nodes
+
+            stats = {
+                'total_nodes': len(nodes),
+                'projects': sum(1 for n in nodes if n.get('type') == 'project'),
+                'workspaces': sum(1 for n in nodes if n.get('type') == 'workspace'),
+                'data_nodes': sum(1 for n in nodes if n.get('type') == 'data'),
+                'containers': sum(1 for n in nodes if n.get('type') == 'container'),
+                'symlinks': sum(1 for n in nodes if n.get('is_symlink')),
+                'highlights': sum(1 for n in nodes if n.get('highlight')),
+                'with_desc': sum(1 for n in nodes if n.get('description')),
+            }
+            panel = self.query_one("#detail-panel", DetailPanel)
+            panel.show_stats(stats, self.pt_theme)
+
+        def action_scroll_home(self):
+            tree = self.query_one("#tree-panel", TTree)
+            tree.scroll_home(animate=False)
+
+        def action_scroll_end(self):
+            tree = self.query_one("#tree-panel", TTree)
+            tree.scroll_end(animate=False)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Find + Stats
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def cmd_find(args):
+    data = load_json(args.input)
+    all_nodes = []
+    for root in data.get('roots', []):
+        all_nodes.extend(walk_nodes(root))
+
+    results = []
+    for n in all_nodes:
+        name = n.get('name', '')
+        path = n.get('path', '')
+        cat = n.get('category', '')
+        ntype = n.get('type', '')
+        desc = n.get('description', '')
+        hl = n.get('highlight', False)
+        depth = n.get('depth', 0)
+
+        if args.name and args.name.lower() not in name.lower():
+            continue
+        if args.category and cat != args.category:
+            continue
+        if args.type and ntype != args.type:
+            continue
+        if args.path and args.path not in path:
+            continue
+        if args.highlight and not hl:
+            continue
+        if args.no_desc and desc:
+            continue
+        if args.depth is not None and depth != args.depth:
+            continue
+        results.append(n)
+
+    if getattr(args, 'json', False):
+        output = [{k: v for k, v in n.items() if k != 'children'} for n in results]
+        print(json.dumps(output, ensure_ascii=False, indent=2))
+        return
+
+    if not results:
+        print("No matches.")
+        return
+
+    max_name = min(max(len(n['name']) for n in results), 40)
+    max_type = min(max(len(n.get('type', '')) for n in results), 12)
+    max_cat = min(max(len(n.get('category', '')) for n in results), 12)
+    print(f"  {'NAME':<{max_name}}  {'TYPE':<{max_type}}  {'CATEGORY':<{max_cat}}  H  PATH")
+    print(f"  {'─'*max_name}  {'─'*max_type}  {'─'*max_cat}  ─  {'─'*50}")
+    for n in results:
+        nm = n['name'][:max_name]
+        nt = n.get('type', '')[:max_type]
+        nc = n.get('category', '')[:max_cat]
+        hl = '★' if n.get('highlight') else ' '
+        d = n.get('description', '')
+        detail = f"  ← {d}" if d else ''
+        print(f"  {nm:<{max_name}}  {nt:<{max_type}}  {nc:<{max_cat}}  {hl}  {n['path']}{detail}")
+    print(f"\n  {len(results)} match(es)")
+
+
+def cmd_stats(args):
+    data = load_json(args.input)
+    nodes = []
+    for root in data.get('roots', []):
+        nodes.extend(walk_nodes(root))
+
+    by_type = Counter(n.get('type', '?') for n in nodes)
+    by_cat = Counter(n.get('category', '?') for n in nodes)
+    with_desc = sum(1 for n in nodes if n.get('description'))
+    highlights = sum(1 for n in nodes if n.get('highlight'))
+    symlinks = sum(1 for n in nodes if n.get('is_symlink'))
+    max_depth = max((n.get('depth', 0) for n in nodes), default=0)
+    roots_count = sum(1 for n in nodes if n.get('depth') == 0)
+
+    if getattr(args, 'json', False):
+        print(json.dumps({
+            'generated_at': data.get('generated_at', '?'),
+            'annotated_at': data.get('annotated_at', '?'),
+            'annotated_by': data.get('annotated_by', '?'),
+            'total_nodes': len(nodes), 'roots': roots_count, 'max_depth': max_depth,
+            'by_type': dict(by_type), 'by_category': dict(by_cat),
+            'with_desc': with_desc, 'without_desc': len(nodes) - with_desc,
+            'highlights': highlights, 'symlinks': symlinks,
+        }, ensure_ascii=False, indent=2))
+        return
+
+    print(f"Server Project Tree")
+    print(f"  Generated:  {data.get('generated_at', '?')}")
+    print(f"  Annotated:  {data.get('annotated_at', '?')} ({data.get('annotated_by', '?')})")
+    print(f"  Watch roots: {roots_count}")
+    print(f"  Max depth:   {max_depth}")
+    print(f"  Total nodes: {len(nodes)}")
+    print()
+    print('  By Category:')
+    for cat, count in by_cat.most_common():
+        pct = count / len(nodes) * 100
+        bar = '█' * int(pct / 2)
+        print(f'    {cat:<14} {count:>4}  {bar}')
+    print()
+    print('  By Type:')
+    for ntype, count in by_type.most_common():
+        pct = count / len(nodes) * 100
+        bar = '█' * int(pct / 2)
+        print(f'    {ntype:<14} {count:>4}  {bar}')
+    print()
+    desc_pct = with_desc / len(nodes) * 100
+    print(f'  Described:  {with_desc}/{len(nodes)} ({desc_pct:.0f}%)')
+    print(f'  Highlights: {highlights}')
+    print(f'  Symlinks:   {symlinks}')
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Update Pipeline
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def cmd_update(args):
+    """Full pipeline: save baseline → scan → diff → annotate → render md."""
+    print("=== Scanning ===")
+    # Save baseline
+    if os.path.exists(RAW_PATH):
+        import shutil
+        shutil.copy(RAW_PATH, BASELINE_PATH)
+    config = load_scan_config()
+    if args.max_depth:
+        config["max_depth"] = args.max_depth
+    include_sizes = not args.no_size
+    t0 = time.time()
+    roots = []
+    for root_path, display_name in config["watch_roots"]:
+        if not os.path.exists(root_path):
+            print(f"Warning: root not found: {root_path}", file=sys.stderr)
+            continue
+        node = scan_root(root_path, display_name, config, include_sizes)
+        if node:
+            roots.append(node)
+    elapsed = time.time() - t0
+    output = {
+        "version": "1.0",
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "scan_duration_s": round(elapsed, 2),
+        "scan_config": {
+            "max_depth": config["max_depth"],
+            "skip_names": sorted(config["skip_names"]),
+            "project_markers": sorted(config["project_markers"]),
+            "data_patterns": sorted(config["data_patterns"]),
+        },
+        "roots": roots,
+    }
+    with open(RAW_PATH, "w", encoding="utf-8") as f:
+        json.dump(output, f, ensure_ascii=False, indent=2)
+    print(f"  {len(roots)} roots, {elapsed:.1f}s")
+
+    # Diff
+    if os.path.exists(BASELINE_PATH):
+        print()
+        print("=== Changes ===")
+        baseline = load_json(BASELINE_PATH)
+        current = output
+        result = compute_diff(baseline, current)
+        added = sum(1 for c in result['changes'] if c['type'] == 'added')
+        removed = sum(1 for c in result['changes'] if c['type'] == 'removed')
+        changed = sum(1 for c in result['changes'] if c['type'] in ('type_changed', 'structure_changed'))
+        unchanged = result['total_new'] - added - changed
+        print(f"  {added} added, {removed} removed, {changed} changed, {unchanged} unchanged")
+
+    # Annotate
+    print()
+    print("=== Annotating ===")
+    data = output
+    desc_map, highlights = load_descriptions()
+    corrections = load_corrections()
+    for root in data.get('roots', []):
+        annotate_node(root, desc_map, highlights, corrections)
+    data['annotated_at'] = time.strftime('%Y-%m-%dT%H:%M:%S')
+    provenance = 'claude-heuristics + descriptions.json'
+    if corrections:
+        provenance += f' + {len(corrections)} corrections'
+    data['annotated_by'] = provenance
+    with open(ANNOTATED_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    print(f"  annotated {'+ corrections' if corrections else ''}")
+
+    # Render MD
+    print()
+    print("=== Rendering PROJECT-TREE.md ===")
+    if HAS_RICH:
+        renderer = MarkdownRenderer(source_json_path=ANNOTATED_PATH)
+        renderer.write(roots, MD_OUTPUT)
+        print(f"  {MD_OUTPUT}")
+    else:
+        print("  skipped (rich not available)")
+
+    print()
+    print("Done. Review with: project-tree diff --summary")
+    print("To fix annotations: edit ~/.config/project-tree/corrections.json")
+
+
+def cmd_tui(args):
+    """Launch interactive Textual TUI."""
+    if not HAS_TEXTUAL:
+        print("Error: 'textual' library required for TUI. Install: pip install textual",
+              file=sys.stderr)
+        print("Fallback: use 'project-tree render split' for one-shot view.",
+              file=sys.stderr)
+        sys.exit(1)
+    if not HAS_RICH:
+        print("Error: 'rich' library required. Install: pip install rich",
+              file=sys.stderr)
+        sys.exit(1)
+    if not os.path.exists(args.input):
+        print(f"No annotated JSON found at {args.input}.", file=sys.stderr)
+        print("Run 'project-tree update' first.", file=sys.stderr)
+        sys.exit(1)
+
+    # Load scan config for max_depth
+    try:
+        config = load_scan_config()
+        max_depth = config.get('max_depth', 4)
+    except Exception:
+        max_depth = 4
+
+    display_depth = args.depth if hasattr(args, 'depth') and args.depth else max(1, max_depth - 1)
+    app = ProjectTreeTUI(
+        annotated_path=args.input,
+        theme_name=args.theme,
+        max_depth=max_depth,
+        display_depth=display_depth,
+    )
+    app.run()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Main CLI
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        description="Unified server project tree CLI",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Default (no subcommand): interactive TUI explorer.\n"
+               "For one-shot: project-tree render [tree|table|dash|split|md]"
+    )
+    p.add_argument('--theme', '-t', default='dracula',
+                   help='Color theme (dracula)')
+    p.add_argument('--list-themes', action='store_true',
+                   help='List available themes and exit')
+
+    sub = p.add_subparsers(dest='command', title='Subcommands')
+
+    # scan
+    sp_scan = sub.add_parser('scan', help='Scan filesystem → raw JSON')
+    sp_scan.add_argument('-o', '--output', default=RAW_PATH)
+    sp_scan.add_argument('--no-size', action='store_true')
+    sp_scan.add_argument('--max-depth', type=int)
+
+    # render
+    sp_render = sub.add_parser('render', help='Render annotated JSON')
+    sp_render.add_argument('mode', nargs='?', default='split',
+                           choices=['tree', 'table', 'dash', 'split', 'md'])
+    sp_render.add_argument('-i', '--input', default=ANNOTATED_PATH)
+    sp_render.add_argument('-o', '--output')
+    sp_render.add_argument('--compact', action='store_true')
+    sp_render.add_argument('--no-size', action='store_true')
+    sp_render.add_argument('--theme', default='dracula')
+
+    # annotate
+    sp_annotate = sub.add_parser('annotate', help='Heuristic annotation + corrections')
+    sp_annotate.add_argument('-i', '--input', default=RAW_PATH)
+    sp_annotate.add_argument('-o', '--output', default=ANNOTATED_PATH)
+    sp_annotate.add_argument('--descriptions-file', default=DESCRIPTIONS_PATH)
+    sp_annotate.add_argument('--corrections-file', default=CORRECTIONS_PATH)
+
+    # corrections
+    sp_corr = sub.add_parser('corrections', help='Apply corrections.json')
+    sp_corr.add_argument('-i', '--input', required=True)
+    sp_corr.add_argument('-o', '--output', required=True)
+    sp_corr.add_argument('--corrections-file', default=CORRECTIONS_PATH)
+
+    # diff
+    sp_diff = sub.add_parser('diff', help='Compare two raw JSON scans')
+    sp_diff.add_argument('--baseline', required=True)
+    sp_diff.add_argument('--current', required=True)
+    sp_diff.add_argument('--json', action='store_true')
+    sp_diff.add_argument('--summary', action='store_true')
+
+    # find
+    sp_find = sub.add_parser('find', help='Query annotated JSON')
+    sp_find.add_argument('name', nargs='?')
+    sp_find.add_argument('--category')
+    sp_find.add_argument('--type', dest='type')
+    sp_find.add_argument('--path', dest='path')
+    sp_find.add_argument('--highlight', action='store_true')
+    sp_find.add_argument('--no-desc', action='store_true')
+    sp_find.add_argument('--depth', type=int)
+    sp_find.add_argument('-i', '--input', default=ANNOTATED_PATH)
+    sp_find.add_argument('--json', action='store_true')
+
+    # stats
+    sp_stats = sub.add_parser('stats', help='Print summary statistics')
+    sp_stats.add_argument('-i', '--input', default=ANNOTATED_PATH)
+    sp_stats.add_argument('--json', action='store_true')
+
+    # update
+    sp_update = sub.add_parser('update', help='Full pipeline: scan → annotate → render md')
+    sp_update.add_argument('--no-size', action='store_true')
+    sp_update.add_argument('--max-depth', type=int)
+
+    # tui
+    sp_tui = sub.add_parser('tui', help='Interactive TUI explorer (default when no subcommand)')
+    sp_tui.add_argument('-i', '--input', default=ANNOTATED_PATH)
+    sp_tui.add_argument('--theme', default='dracula')
+    sp_tui.add_argument('--depth', type=int)
+
+    return p
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if args.list_themes and HAS_RICH:
+        themes = ThemeManager.list_themes()
+        if not themes:
+            print("No themes found.")
+            return
+        print(f"{'Key':<12} {'Name':<20} Description")
+        print("-" * 60)
+        for key, name, desc in themes:
+            print(f"{key:<12} {name:<20} {desc}")
+        return
+    elif args.list_themes:
+        print("Error: 'rich' library required for themes.", file=sys.stderr)
+        return
+
+    # Dispatch subcommand
+    if args.command == 'scan':
+        cmd_scan(args)
+    elif args.command == 'render':
+        cmd_render(args)
+    elif args.command == 'annotate':
+        cmd_annotate(args)
+    elif args.command == 'corrections':
+        cmd_corrections(args)
+    elif args.command == 'diff':
+        cmd_diff(args)
+    elif args.command == 'find':
+        cmd_find(args)
+    elif args.command == 'stats':
+        cmd_stats(args)
+    elif args.command == 'update':
+        cmd_update(args)
+    elif args.command == 'tui':
+        cmd_tui(args)
+    elif args.command is None:
+        # Default: interactive TUI
+        cmd_tui(argparse.Namespace(
+            input=ANNOTATED_PATH,
+            theme=getattr(args, 'theme', 'dracula'),
+            depth=None,
+        ))
+    else:
+        parser.print_help()
+
+
+if __name__ == '__main__':
+    main()

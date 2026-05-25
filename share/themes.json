@@ -1,0 +1,47 @@
+{
+  "dracula": {
+    "name": "Dracula",
+    "description": "暗紫/橙，高对比，演示截图",
+    "indicators": {
+      "collapsed": "bold #f8f8f2",
+      "expanded": "#6272a4"
+    },
+    "colors": {
+      "root": "bold #f8f8f2",
+      "tools": "bold #8be9fd",
+      "project": "bold #50fa7b",
+      "workspace": "bold #bd93f9",
+      "data": "#f1fa8c",
+      "learn": "bold #ff79c6",
+      "archive": "italic #f8f8f2",
+      "infra": "bold #ffb86c",
+      "config": "#8be9fd",
+      "symlink": "underline #8be9fd",
+      "annotation": "bold reverse #bd93f9"
+    },
+    "styles": {
+      "guide": "#44475a",
+      "border": "#6272a4",
+      "panel_title": "bold #f8f8f2 on #6272a4",
+      "table_header": "bold reverse #bd93f9",
+      "description": "italic #f8f8f2",
+      "size": "#6272a4",
+      "highlight": "bold reverse #f1fa8c",
+      "stats_border": "#6272a4"
+    },
+    "tui": {
+      "panel_bg": "#282a36",
+      "panel_border": "#6272a4",
+      "panel_title": "bold #f8f8f2",
+      "detail_label": "#6272a4",
+      "detail_value": "#f8f8f2",
+      "stats_number": "bold #8be9fd",
+      "stats_label": "#f8f8f2",
+      "shortcut_key": "bold #bd93f9",
+      "shortcut_desc": "#6272a4",
+      "search_input": "#f8f8f2 on #44475a",
+      "depth_badge": "bold #f1fa8c on #44475a",
+      "theme_badge": "bold #50fa7b on #44475a"
+    }
+  }
+}
