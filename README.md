@@ -7,7 +7,7 @@ Stops at **project boundaries** (`.git`, `setup.py`, `SKILL.md`, `package.json`)
 ## Install
 
 ```bash
-git clone https://github.com/user/project-tree.git
+git clone https://github.com/wilianyichen/project-tree.git
 cd project-tree
 ./install.sh
 ```
